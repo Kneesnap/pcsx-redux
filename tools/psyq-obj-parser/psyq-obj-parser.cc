@@ -40,6 +40,7 @@
     if (verbose) fmt::print(__VA_ARGS__)
 
 /* The constants from the psyq link files */
+// In PSYLINK.EXE 2.52, the table for handling these is located at 0x4039E4 containing 45 entries). Divide by two to get the opcode's index into that array.
 enum class PsyqOpcode : uint8_t {
     END = 0,
     BYTES = 2,
@@ -68,6 +69,7 @@ enum class PsyqOpcode : uint8_t {
     FUNCTION_START2 = 86,
 };
 
+// In PSYLINK.EXE 2.52, the reloc function table is located at 0x40177C containing 50 entries. Divide by two to get the opcode's index into that array.
 enum class PsyqRelocType : uint8_t {
     REL32_BE = 8,
     REL32 = 16,
@@ -80,6 +82,7 @@ enum class PsyqRelocType : uint8_t {
     GPREL16 = 100,
 };
 
+// In PSYLINK.EXE 2.52, the expression function table is located at 0x40108C containing 38 entries. Divide by two to get the opcode's index into that array.
 enum class PsyqExprOpcode : uint8_t {
     VALUE = 0,
     SYMBOL = 2,
@@ -135,6 +138,7 @@ struct PsyqLnkFile {
         std::string name;
         uint32_t zeroes = 0;
         uint32_t uninitializedOffset = 0;
+        PsyqLnkFile::Symbol* lastLocalSymbol = nullptr;
         PCSX::Slice data;
         std::list<Relocation> relocations;
         uint32_t getFullSize() { return data.size() + zeroes + uninitializedOffset; }
@@ -175,7 +179,7 @@ struct PsyqLnkFile {
         }
         void display(PsyqLnkFile* lnk);
         bool generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_section_accessor& stra,
-                               ELFIO::symbol_section_accessor& syma);
+                               ELFIO::symbol_section_accessor& syma, bool enableCommonSymbols);
     };
     struct Relocation {
         PsyqRelocType type;
@@ -217,7 +221,7 @@ struct PsyqLnkFile {
     std::string elfConversionError;
 
     void display();
-    bool writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian);
+    bool writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian, bool enableCommonSymbols);
     template <typename... Args>
     inline void setElfConversionError(std::string_view formatStr, Args&&... args) {
         elfConversionError = fmt::format(fmt::runtime(formatStr), args...);
@@ -263,9 +267,22 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool 
                     // Static bss symbols will be represented as a ZEROES opcode instead of UNINITIALIZED.
                     // This will cause them to have a size of zero, so ignore size zero symbols here.
                     // Their relocs will resolve to an offset of the local .bss instead, so this causes no issues.
-                    if (symbol.size > 0) {
                         auto section = ret->sections.find(symbol.sectionIndex);
-                        if (section != ret->sections.end() && section->isBss()) {
+                    if (section != ret->sections.end() && section->isBss()) {
+                        if (symbol.symbolType == Symbol::Type::LOCAL) {
+                            PsyqLnkFile::Symbol* lastLocalSymbol = section->lastLocalSymbol;
+                            if (lastLocalSymbol && lastLocalSymbol->offset > symbol.offset) {
+                                fmt::print(stderr,
+                                           "Got lastLocalSymbol at offset {:08x} but the current symbol comes later at "
+                                           "{:08x}.\n",
+                                           lastLocalSymbol->offset, symbol.offset);
+                                return nullptr;
+                            }
+
+                            if (lastLocalSymbol) lastLocalSymbol->size = symbol.offset - lastLocalSymbol->offset;
+                            if (section->zeroes) symbol.size = section->zeroes - symbol.offset;
+                            section->lastLocalSymbol = &symbol;
+                        } else if (symbol.size > 0) {
                             auto align = std::min((uint32_t)section->alignment, symbol.size) - 1;
                             section->uninitializedOffset += align;
                             section->uninitializedOffset &= ~align;
@@ -453,7 +470,7 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool 
                 uint16_t sectionIndex = file->read<uint16_t>();
                 uint32_t size = file->read<uint32_t>();
                 std::string name = readPsyqString(file);
-
+                vprint("Uninitialized: symbol {}, section {}, size {}, name {}\n", symbolIndex, sectionIndex, size, name);
                 Symbol* symbol = new Symbol();
                 symbol->symbolType = Symbol::Type::UNINITIALIZED;
                 symbol->sectionIndex = sectionIndex;
@@ -840,7 +857,8 @@ void PsyqLnkFile::Expression::display(PsyqLnkFile* lnk, bool top) {
 }
 
 /* The ELF writer code */
-bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian) {
+bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian,
+    bool enableCommonSymbols) {
     ELFIO::elfio writer;
     writer.create(ELFIO::ELFCLASS32, bigEndian ? ELFIO::ELFDATA2MSB : ELFIO::ELFDATA2LSB);
     writer.set_os_abi(abiNone ? ELFIO::ELFOSABI_NONE : ELFIO::ELFOSABI_LINUX);
@@ -883,7 +901,7 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
     // Generate local symbols first
     for (auto& symbol : symbols) {
         if (symbol.symbolType == Symbol::Type::LOCAL) {
-            bool success = symbol.generateElfSymbol(this, stra, syma);
+            bool success = symbol.generateElfSymbol(this, stra, syma, enableCommonSymbols);
             if (!success) return false;
         }
     }
@@ -893,7 +911,7 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
     // Generate all other symbols afterwards
     for (auto& symbol : symbols) {
         if (symbol.symbolType != Symbol::Type::LOCAL) {
-            bool success = symbol.generateElfSymbol(this, stra, syma);
+            bool success = symbol.generateElfSymbol(this, stra, syma, enableCommonSymbols);
             if (!success) return false;
         }
     }
@@ -918,12 +936,13 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
 }
 
 bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_section_accessor& stra,
-                                            ELFIO::symbol_section_accessor& syma) {
+                                            ELFIO::symbol_section_accessor& syma, bool enableCommonSymbols) {
     ELFIO::Elf_Half elfSectionIndex = 0;
+    ELFIO::Elf_Word elfSymbolType = ELFIO::STT_NOTYPE;
+    unsigned char elfSymbolBind = ELFIO::STB_GLOBAL;
     bool isText = false;
-    bool isWeak = false;
 
-    fmt::print("    :: Generating symbol {} {} {}\n", name, getOffset(psyq), sectionIndex);
+    fmt::print("    :: Generating symbol {} {} {} {}\n", name, getOffset(psyq), sectionIndex, size);
     if (symbolType != Type::IMPORTED) {
         auto section = psyq->sections.find(sectionIndex);
         if (section == psyq->sections.end()) {
@@ -933,7 +952,14 @@ bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_sec
         }
         elfSectionIndex = section->section->get_index();
         isText = section->isText();
-        isWeak = symbolType != Type::EXPORTED;
+        if (!isText && enableCommonSymbols && (symbolType == Type::UNINITIALIZED || symbolType == Type::LOCAL)) {
+            elfSymbolType = ELFIO::STT_OBJECT;
+            elfSectionIndex = ELFIO::SHN_COMMON;
+        } else if (!isText && symbolType == Type::LOCAL) {
+            elfSymbolBind = ELFIO::STB_LOCAL;
+        } else {
+            if (symbolType != Type::EXPORTED) elfSymbolBind = ELFIO::STB_WEAK;
+    }
     }
     uint32_t functionSize = 0;
     if (isText) {
@@ -941,12 +967,10 @@ bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_sec
         if (functionSizeIter != psyq->functionSizes.end()) {
             functionSize = functionSizeIter->second;
         }
+        elfSymbolType = ELFIO::STT_FUNC;
     }
     elfSym = syma.add_symbol(stra, name.c_str(), getOffset(psyq), isText ? functionSize : size,
-                             isWeak                      ? ELFIO::STB_WEAK
-                             : symbolType == Type::LOCAL ? ELFIO::STB_LOCAL
-                                                         : ELFIO::STB_GLOBAL,
-                             isText ? ELFIO::STT_FUNC : ELFIO::STT_NOTYPE, 0, elfSectionIndex);
+                             elfSymbolBind, elfSymbolType, 0, elfSectionIndex);
     return true;
 }
 
@@ -1454,7 +1478,7 @@ int main(int argc, char** argv) {
     const bool oneInput = inputs.size() == 1;
     if (asksForHelp || noInput || (hasOutput && !oneInput)) {
         fmt::print(R"(
-Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o]
+Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o] [-b] [-c]
   input.obj      mandatory: specify the input psyq LNK object file.
   -h             displays this help information and exit.
   -v             turns on verbose mode for the parser.
@@ -1464,12 +1488,17 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
   -o output.o    tries to dump the parsed psyq LNK file into an ELF file;
                  can only work with a single input file.
   -b             output a big-endian ELF file.
+  -c             output local symbols to a .common/.scommon section
+                 (Expected use-case is for symbol-ordering in decomp projects.)
 )",
                    argv[0]);
         return -1;
     }
 
     bool verbose = args.get<bool>("v").value_or(false);
+    bool useNoneAbi = args.get<bool>("n").value_or(false);
+    bool useBigEndian = args.get<bool>("b").value_or(false);
+    bool enableCommonSymbols = args.get<bool>("c").value_or(false);
 
     int ret = 0;
 
@@ -1491,8 +1520,8 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
                 if (hasOutput) {
                     fmt::print(":: Converting {} to {}...\n", input, output.value());
                     std::string prefix = args.get<std::string>("p").value_or("");
-                    bool success = psyq->writeElf(prefix, output.value(), args.get<bool>("n").value_or(false),
-                                                  args.get<bool>("b").value_or(false));
+                    bool success = psyq->writeElf(prefix, output.value(), useNoneAbi,
+                                                  useBigEndian, enableCommonSymbols);
                     if (success) {
                         fmt::print(":: Conversion completed.\n");
                     } else {
